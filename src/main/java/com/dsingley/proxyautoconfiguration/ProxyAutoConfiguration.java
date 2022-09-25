@@ -2,9 +2,17 @@ package com.dsingley.proxyautoconfiguration;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Suppliers;
+import com.google.common.cache.AbstractLoadingCache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.NonNull;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
+import javax.annotation.CheckForNull;
 import javax.script.Invocable;
 import javax.script.ScriptEngine;
 import javax.script.ScriptEngineManager;
@@ -21,6 +29,7 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -32,9 +41,10 @@ public class ProxyAutoConfiguration {
     private static final String SCRIPT_ENGINE_NAME = "nashorn";
     private static final String JS_FUNCTION_NAME = "FindProxyForURL";
 
-    private final Supplier<String> dnsResolveJsFunctionSupplier;
-    private final Supplier<String> pacJsFunctionSupplier;
+    private final String dnsResolveJsFunction;
+    private final String pacJsFunctions;
     private final Supplier<String> pacFileSupplier;
+    private final LoadingCache<CacheKey, String> loadingCache;
 
     public static void main(String[] args) throws Exception {
         String pacFileUrl = System.getenv(PAC_FILE_URL);
@@ -54,18 +64,25 @@ public class ProxyAutoConfiguration {
 
     @SneakyThrows
     public ProxyAutoConfiguration(URL pacFileUrl, long duration, TimeUnit timeUnit) {
-        this(Suppliers.memoizeWithExpiration(() -> loadPacFile(pacFileUrl), duration, timeUnit));
+        dnsResolveJsFunction = generateDnsResolveJsFunction();
+        pacJsFunctions = loadPacJsFunctions();
+        pacFileSupplier = Suppliers.memoizeWithExpiration(() -> loadPacFile(pacFileUrl), duration, timeUnit);
+        loadingCache = CacheBuilder.newBuilder()
+                .expireAfterWrite(duration, timeUnit)
+                .build(new CacheLoader<CacheKey, String>() {
+                    @Override
+                    public String load(@NonNull CacheKey key) {
+                        return findProxyForURL(key);
+                    }
+                });
     }
 
     @VisibleForTesting
     ProxyAutoConfiguration(String pacFile) {
-        this(() -> pacFile);
-;    }
-
-    private ProxyAutoConfiguration(Supplier<String> pacFileSupplier) {
-        dnsResolveJsFunctionSupplier = Suppliers.memoize(ProxyAutoConfiguration::generateDnsResolveJsFunction);
-        pacJsFunctionSupplier = Suppliers.memoize(ProxyAutoConfiguration::loadPacJsFunctions);
-        this.pacFileSupplier = pacFileSupplier;
+        dnsResolveJsFunction = generateDnsResolveJsFunction();
+        pacJsFunctions = loadPacJsFunctions();
+        pacFileSupplier = () -> pacFile;
+        loadingCache = new NonCachingLoadingCache<>(this::findProxyForURL);
     }
 
     @SneakyThrows
@@ -80,9 +97,17 @@ public class ProxyAutoConfiguration {
     @SneakyThrows
     public String findProxyForURL(String url, String host) {
         log.info("{}('{}', '{}')", JS_FUNCTION_NAME, url, host);
+        return loadingCache.get(new CacheKey(url, host));
+    }
+
+    @SneakyThrows
+    private String findProxyForURL(CacheKey cacheKey) {
+        String url = cacheKey.getUrl();
+        String host = cacheKey.getHost();
+        log.info("evaluating {}('{}', '{}')", JS_FUNCTION_NAME, url, host);
         String script = String.join("\n", Arrays.asList(
-                dnsResolveJsFunctionSupplier.get(),
-                pacJsFunctionSupplier.get(),
+                dnsResolveJsFunction,
+                pacJsFunctions,
                 pacFileSupplier.get()
         ));
         ScriptEngine scriptEngine = SCRIPT_ENGINE_MANAGER.getEngineByName(SCRIPT_ENGINE_NAME);
@@ -167,5 +192,37 @@ public class ProxyAutoConfiguration {
         return IntStream.range(0, lines.length)
                 .mapToObj(i -> String.format(formatString, i + 1, lines[i].replaceAll("\\s$", "")))
                 .collect(Collectors.joining());
+    }
+
+    @Getter
+    @EqualsAndHashCode
+    private static class CacheKey {
+        private final String url;
+        private final String host;
+
+        private CacheKey(String url, String host) {
+            this.url = url;
+            this.host = host;
+        }
+    }
+
+    private static class NonCachingLoadingCache<K, V> extends AbstractLoadingCache<K, V> {
+        private final Function<K, V> function;
+
+        private NonCachingLoadingCache(Function<K, V> function) {
+            this.function = function;
+        }
+
+        @Override
+        public V get(@NonNull K key) {
+            return function.apply(key);
+        }
+
+        @SuppressWarnings("unchecked")
+        @CheckForNull
+        @Override
+        public V getIfPresent(@NonNull Object key) {
+            return function.apply((K) key);
+        }
     }
 }
