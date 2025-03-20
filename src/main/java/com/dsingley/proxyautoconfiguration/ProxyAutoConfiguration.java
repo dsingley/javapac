@@ -12,7 +12,6 @@ import lombok.NonNull;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
-import javax.annotation.CheckForNull;
 import javax.script.Invocable;
 import javax.script.ScriptEngine;
 import javax.script.ScriptEngineManager;
@@ -219,7 +218,6 @@ public class ProxyAutoConfiguration {
         }
 
         @SuppressWarnings("unchecked")
-        @CheckForNull
         @Override
         public V getIfPresent(@NonNull Object key) {
             return function.apply((K) key);
